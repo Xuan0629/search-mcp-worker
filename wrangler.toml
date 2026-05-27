@@ -1,0 +1,9 @@
+name = "search-mcp-worker"
+main = "src/index.ts"
+compatibility_date = "2025-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ENVIRONMENT = "production"
+
+# Secret: BOCHA_API_KEY — set via `wrangler secret put BOCHA_API_KEY`
