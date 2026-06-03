@@ -1,10 +1,65 @@
 # search-mcp-worker
 
 > A self-hosted MCP (Model Context Protocol) search aggregation service running on Cloudflare Workers.
+> [English](#features) | [中文](#功能概览)
 
 一个部署在 Cloudflare Workers 上的 MCP 搜索聚合服务，提供 24 个搜索/获取工具，通过标准 MCP 协议（JSON-RPC 2.0）对外暴露，可被任何 MCP 客户端直接接入。
 
 **特点：免费、自托管、智能路由、中文优先。**
+
+---
+
+## ⚡ 30 秒接入（无需部署）
+
+本项目提供了一个公开的 MCP 端点，你可以直接将其接入你的 AI 客户端，无需自己部署任何东西：
+
+```
+https://search-mcp-worker.sean010629.workers.dev/mcp
+```
+
+### Claude Desktop / Cursor / Windsurf / VS Code
+
+在你的 MCP 客户端配置文件中添加：
+
+```json
+{
+  "mcpServers": {
+    "search": {
+      "url": "https://search-mcp-worker.sean010629.workers.dev/mcp"
+    }
+  }
+}
+```
+
+### Hermes Agent
+
+```bash
+hermes mcp add search --url "https://search-mcp-worker.sean010629.workers.dev/mcp"
+```
+
+### 其他 MCP 客户端
+
+任何支持 Streamable HTTP transport 的 MCP 客户端均可接入，将 MCP server URL 设为：
+
+```
+https://search-mcp-worker.sean010629.workers.dev/mcp
+```
+
+### curl 测试
+
+```bash
+# 初始化连接
+curl -X POST https://search-mcp-worker.sean010629.workers.dev/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+
+# 智能搜索（自动检测语言和意图）
+curl -X POST https://search-mcp-worker.sean010629.workers.dev/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"query":"Rust async runtime","limit":3}}}'
+```
+
+> **公开实例说明：** 免费搜索引擎（DuckDuckGo/Bing/Baidu/arXiv/GitHub 等 19 个）均可直接使用。Bocha 引擎需要 API Key，公开实例已内置，但额度有限。如果你需要更高的 Bocha 配额或有数据隐私顾虑，建议[自行部署](#快速开始自托管)。
 
 ---
 
@@ -103,7 +158,9 @@
 
 ---
 
-## 快速开始
+## 快速开始（自托管）
+
+> 如果你只想**使用**本服务，无需阅读以下内容——直接看上面的 [⚡ 30 秒接入](#-30-秒接入无需部署) 即可。以下内容面向想要**自己部署**的用户。
 
 ### 前置条件
 
@@ -271,7 +328,9 @@ Content-Type: application/json
 
 ---
 
-## 接入 MCP 客户端
+## 接入 MCP 客户端（自托管实例）
+
+> 公开实例的接入方式见上方 [⚡ 30 秒接入](#-30-秒接入无需部署)。以下为你**自己部署后**的接入方式——将 URL 替换为你的 `*.workers.dev` 域名。
 
 ### Claude Desktop / Cursor / Windsurf
 
