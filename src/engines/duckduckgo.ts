@@ -5,6 +5,41 @@ function randomUA(): string {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
+/**
+ * Decode a raw URL extracted from DDG HTML.
+ *
+ * DDG wraps real result URLs inside redirect links like:
+ *   //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&amp;rut=...
+ *
+ * This function:
+ *  1. Cleans HTML entities (&amp; → &) that DDG embeds in href attributes.
+ *  2. Detects the DDG redirect pattern and extracts + decodes the `uddg`
+ *     query parameter which contains the actual destination URL.
+ *  3. Falls back to plain decodeURIComponent for non-redirect URLs.
+ */
+function decodeDdgUrl(raw: string): string {
+  // Step 1 — clean HTML entities that DDG embeds inside href values
+  let url = raw.replace(/&amp;/g, '&');
+
+  // Step 2 — check for DDG redirect URL and extract the real URL from uddg param
+  const ddgRedirectMatch = url.match(/duckduckgo\.com\/l\/\?(?:.*&)?uddg=([^&]+)/);
+  if (ddgRedirectMatch) {
+    try {
+      return decodeURIComponent(ddgRedirectMatch[1]);
+    } catch {
+      // If decoding fails, return the raw uddg value as-is
+      return ddgRedirectMatch[1];
+    }
+  }
+
+  // Step 3 — not a redirect, just decode percent-encoding normally
+  try {
+    return decodeURIComponent(url);
+  } catch {
+    return url;
+  }
+}
+
 function extractResults(html: string, engine: string): SearchResult[] {
   const results: SearchResult[] = [];
 
@@ -16,7 +51,7 @@ function extractResults(html: string, engine: string): SearchResult[] {
   const titles: Array<{url: string; title: string}> = [];
   let match;
   while ((match = titleRegex.exec(html)) !== null) {
-    titles.push({ url: decodeURIComponent(match[1]), title: stripHtml(match[2]) });
+    titles.push({ url: decodeDdgUrl(match[1]), title: stripHtml(match[2]) });
   }
 
   const snippets: string[] = [];
@@ -42,7 +77,7 @@ function extractResults(html: string, engine: string): SearchResult[] {
 
     const links: Array<{url: string; title: string}> = [];
     while ((match = linkRegex.exec(html)) !== null) {
-      links.push({ url: match[1], title: stripHtml(match[2]) });
+      links.push({ url: decodeDdgUrl(match[1]), title: stripHtml(match[2]) });
     }
 
     const snips2: string[] = [];
