@@ -35,6 +35,9 @@ export const CIRCUIT_BREAKER_FREEZE_MS = 5 * 60 * 1000;  // 5 minutes
 // Engine health event window (for /health stats)
 export const ENGINE_HEALTH_WINDOW_MS = 60 * 60 * 1000;   // 1 hour
 
+// `site:example.com query` operator
+export const SITE_TARGET_PATTERN = /^\s*site:([^\s/]+)\s+(.+)$/i;
+
 // Results
 export const DEFAULT_RESULT_LIMIT = 5;
 export const MAX_RESULT_LIMIT = 10;
