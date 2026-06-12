@@ -93,6 +93,37 @@ export function _resetEngineCache(): void {
 }
 
 // ============================================================
+// Secret Status
+// ============================================================
+//
+// Helper for the /admin/secrets endpoint: report which Wrangler secrets
+// are configured without ever calling the upstream. This is the cheap,
+// zero-quota way to confirm that BOCHA_API_KEY was actually injected
+// during `wrangler deploy` — the value itself is never read (it lives
+// encrypted in the Worker runtime, accessible via c.env.BOCHA_API_KEY
+// but never exposed to the response).
+//
+// Operators can hit /admin/secrets post-deploy and immediately see if a
+// key is missing, without having to call an MCP tool that would waste
+// the Bocha API quota to discover the same thing.
+
+function getSecretStatus(env: Env): Record<string, 'set' | 'missing' | 'disabled'> {
+  // DISABLED_ENGINES determines which engines we even *try* to call.
+  // If a key is set but the engine is disabled, the user doesn't care.
+  // Conversely, an engine NOT in DISABLED_ENGINES but with a missing key
+  // would 100% fail at runtime, so we surface that explicitly.
+  const out: Record<string, 'set' | 'missing' | 'disabled'> = {};
+
+  // Bocha is currently disabled (see DISABLED_ENGINES below) because the
+  // upstream API key has been returning 403 consistently. Once it's
+  // re-enabled, remove the 'disabled' entry here and add the key check.
+  out.BOCHA_API_KEY = DISABLED_ENGINES.has('bocha') ? 'disabled' :
+                       env.BOCHA_API_KEY ? 'set' : 'missing';
+
+  return out;
+}
+
+// ============================================================
 // App
 // ============================================================
 
@@ -108,10 +139,22 @@ app.get('/', (c) => c.json({
   endpoint: '/mcp',
   engines: getEngineHealthStats(),
   circuit_breakers: getCircuitState(),
+  secrets: getSecretStatus(c.env),
 }));
 
 app.get('/healthz', (c) => c.json({
   status: 'ok',
+  engines: getEngineHealthStats(),
+  circuit_breakers: getCircuitState(),
+}));
+
+app.get('/admin/secrets', (c) => c.json({
+  secrets: getSecretStatus(c.env),
+  // Echo the disabled set so operators can correlate 'disabled' status
+  // with the static config in one place.
+  disabled_engines: Array.from(DISABLED_ENGINES),
+  // Echo health stats so the operator doesn't have to hit a second
+  // endpoint to see why an engine might be in 'set' but still failing.
   engines: getEngineHealthStats(),
   circuit_breakers: getCircuitState(),
 }));
