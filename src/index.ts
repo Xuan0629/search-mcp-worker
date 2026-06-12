@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { Env, JsonRpcRequest, JsonRpcResponse, McpToolResult, SearchResult, SearchResponse } from './types';
-import { DEFAULT_RESULT_LIMIT, MAX_RESULT_LIMIT } from './constants';
+import { DEFAULT_RESULT_LIMIT, MAX_RESULT_LIMIT, SEARCH_RACE_TIMEOUT_MS } from './constants';
 import { handleInitialize, handleToolsList, handlePing, makeError, makeToolResult, makeToolError } from './mcp/protocol';
 import type { ToolHandler } from './mcp/protocol';
 import { route, routeExplicit } from './router';
@@ -274,34 +274,88 @@ const toolHandlers: Record<string, ToolHandler> = {
       return formatSearchResponse(cached, routing, { cache_hit: true });
     }
 
-    // Execute engines (skipping any that are circuit-broken)
+    // Race-pattern engine execution: fire all selected engines
+    // concurrently and wait up to SEARCH_RACE_TIMEOUT_MS for the
+    // slow ones to settle. Engines that haven't returned by the
+    // deadline are still tracked as 'attempted' (their promise is
+    // still in flight) but won't contribute results to this response.
+    //
+    // Why race and not the previous serial for-loop:
+    // - Serial: a slow Bing response (12s timeout) blocks Sogou,
+    //   Baidu, etc., even when Bing returns 0 results at the 12s mark.
+    //   For a 'search' tool where quick results are the priority,
+    //   serial execution wastes the user's wall-clock time.
+    // - Race: all engines fire in parallel, we get Bing's 1.2s
+    //   response + DDG's 0.8s response + ... well within the
+    //   8s budget. The timeout is the wall-clock cap, not a
+    //   per-engine cap; per-engine timeouts are still set on
+    //   individual fetch() calls inside each engine.
+    //
+    // We use Promise.race with a sentinel rather than racing against
+    // allSettled so that the slow stragglers don't drag out the
+    // response past the timeout. Once the timeout fires we treat any
+    // engine whose promise hasn't settled as "attempted but timed out";
+    // their in-flight fetches are NOT cancelled (workerd doesn't
+    // support cancelling an in-flight fetch), but the response goes
+    // out on time. The stragglers finish in the background and their
+    // results are discarded.
     const allResults: SearchResult[] = [];
     const attempted: string[] = [];
-    const skipped: string[] = [];
+    const timedOut: string[] = [];
+    const liveEngines = routing.engines.filter((e) => !isEngineFrozen(e));
+    const skipped = routing.engines.filter((e) => isEngineFrozen(e));
 
-    for (const engineName of routing.engines) {
-      if (isEngineFrozen(engineName)) {
-        skipped.push(engineName);
-        continue;
-      }
+    type Settled = { engine: string; results: SearchResult[] } | { engine: string; error: string };
+
+    // Wait for all engines to settle OR the wall-clock timeout to
+    // fire, whichever comes first. We use a custom settled-flag
+    // pattern because the native Promise API has no way to ask
+    // "which of these N promises have settled already" — Promise.allSettled
+    // always waits for all of them, and Promise.race only gives you
+    // the first one. So each work item flips its flag when it
+    // settles, and after the race we read the flags to know which
+    // engines contributed results.
+    const settledFlags: boolean[] = liveEngines.map(() => false);
+    const workResults: Settled[] = liveEngines.map(() => ({ engine: '', error: 'never-ran' }));
+    const work: Promise<void>[] = liveEngines.map(async (engineName, i) => {
       try {
         const results = await executeEngine(engineName, query, limit, args, env);
-        attempted.push(engineName);
+        const filtered = siteTarget ? filterBySiteTarget(results, siteTarget.host) : results;
+        workResults[i] = { engine: engineName, results: filtered };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'failed';
+        workResults[i] = { engine: engineName, error: message };
+      } finally {
+        settledFlags[i] = true;
+      }
+    });
 
-        // If site: was set, drop results that aren't on the target host.
-        const filtered = siteTarget
-          ? filterBySiteTarget(results, siteTarget.host)
-          : results;
+    const settled = await Promise.race([
+      Promise.all(work).then(() => ({ kind: 'done' as const })),
+      new Promise<{ kind: 'timeout' }>((resolve) =>
+        setTimeout(() => resolve({ kind: 'timeout' }), SEARCH_RACE_TIMEOUT_MS),
+      ),
+    ]);
 
-        allResults.push(...filtered);
-
-        // Quick mode: stop after first engine that produced usable results
-        if (autoMode === 'quick' && filtered.length > 0) break;
-      } catch {
-        attempted.push(engineName);
-        continue;
+    // Walk the flags. Any work item that flipped its flag is "settled";
+    // anything else is treated as timed out and we stop waiting.
+    for (let i = 0; i < liveEngines.length; i++) {
+      const engineName = liveEngines[i];
+      attempted.push(engineName);
+      if (settledFlags[i]) {
+        const v = workResults[i];
+        if ('results' in v) {
+          allResults.push(...v.results);
+        }
+        // Errors are already recorded by executeEngine into the
+        // health/circuit-breaker stats; we just don't include the
+        // engine in the result set.
+      } else {
+        timedOut.push(engineName);
       }
     }
+    // (settled.kind is unused beyond telling us if the race finished;
+    // the flags array is the source of truth.)
 
     const { results: processed, stats } = processResultsWithStats(allResults, query, limit);
     const response: SearchResponse = {
@@ -316,7 +370,8 @@ const toolHandlers: Record<string, ToolHandler> = {
       cache_hit: false,
       filtered_count: stats.filtered_count,
       filter_reason: stats.filter_reason ?? undefined,
-      skipped_engines: skipped,
+      skipped_engines: [...skipped, ...timedOut],
+      timed_out_engines: timedOut,
     });
   },
 
@@ -482,7 +537,7 @@ async function singleEngine(
 function formatSearchResponse(
   response: SearchResponse,
   routing: { engines: string[]; intent: string; language: string },
-  meta?: { filtered_count?: number; filter_reason?: string; skipped_engines?: string[]; cache_hit?: boolean },
+  meta?: { filtered_count?: number; filter_reason?: string; skipped_engines?: string[]; cache_hit?: boolean; timed_out_engines?: string[] },
 ): McpToolResult {
   const header = `## Search Results\n\nQuery: "${response.query}" | Intent: ${routing.intent} | Lang: ${routing.language} | Engines: ${response.engines.join(', ')}${response.cached ? ' (cached)' : ''}`;
   const text = `${header}\n\n${formatResults(response.results)}`;
@@ -500,6 +555,7 @@ function formatSearchResponse(
       language: routing.language,
       engines_attempted: response.engines,
       engines_skipped: meta?.skipped_engines ?? [],
+      engines_timed_out: meta?.timed_out_engines ?? [],
       cache_hit: meta?.cache_hit ?? response.cached,
       filtered_count: meta?.filtered_count ?? 0,
       filter_reason: meta?.filter_reason ?? null,

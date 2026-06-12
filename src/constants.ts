@@ -35,6 +35,17 @@ export const CIRCUIT_BREAKER_FREEZE_MS = 5 * 60 * 1000;  // 5 minutes
 // Engine health event window (for /health stats)
 export const ENGINE_HEALTH_WINDOW_MS = 60 * 60 * 1000;   // 1 hour
 
+// Search race-pattern wall-clock budget.
+// The 'search' tool runs all selected engines concurrently and waits
+// up to this long for them to settle. After the timeout fires, we
+// process whatever results we have and surface the rest as 'engines_skipped'
+// in _meta so the caller knows the response is partial. Setting this
+// lower reduces tail latency for users; setting it higher gives engines
+// more time to return useful results. The default (8s) is well under
+// the workerd 30s wall-clock limit and well over the typical 1-2s
+// Bing/DDG response time.
+export const SEARCH_RACE_TIMEOUT_MS = 8_000;
+
 // `site:example.com query` operator
 export const SITE_TARGET_PATTERN = /^\s*site:([^\s/]+)\s+(.+)$/i;
 
