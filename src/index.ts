@@ -6,6 +6,14 @@ import type { ToolHandler } from './mcp/protocol';
 import { route, routeExplicit } from './router';
 import { SearchCache, makeCacheKey } from './cache';
 import { processResults } from './scorer';
+import {
+  isEngineFrozen,
+  recordEngineSuccess,
+  recordEngineBlocked,
+  getCircuitState,
+} from './circuit-breaker';
+import { recordEngineHealthEvent, getEngineHealthStats } from './engine-health';
+import { parseSiteTargetQuery, filterBySiteTarget } from './site-target';
 // Engines
 import { searchBocha, searchBochaAI } from './engines/bocha';
 import { searchDuckDuckGo } from './engines/duckduckgo';
@@ -32,9 +40,15 @@ app.get('/', (c) => c.json({
   service: 'search-mcp-worker',
   version: '0.1.0',
   endpoint: '/mcp',
+  engines: getEngineHealthStats(),
+  circuit_breakers: getCircuitState(),
 }));
 
-app.get('/healthz', (c) => c.json({ status: 'ok' }));
+app.get('/healthz', (c) => c.json({
+  status: 'ok',
+  engines: getEngineHealthStats(),
+  circuit_breakers: getCircuitState(),
+}));
 
 // ---- CORS ----
 
@@ -130,34 +144,50 @@ const toolHandlers: Record<string, ToolHandler> = {
 
   // ---- Smart Search ----
   'search': async (args, env) => {
-    const query = String(args.query);
+    const originalQuery = String(args.query);
     const limit = clampLimit(args.limit);
     const autoMode = String(args.auto_mode || 'quick');
     const explicitEngines = args.engines as string[] | undefined;
 
-    const routing = explicitEngines
-      ? routeExplicit(explicitEngines, query)
-      : route(query);
+    // `site:example.com query` — strip the operator and remember the target host.
+    const siteTarget = parseSiteTargetQuery(originalQuery);
+    const query = siteTarget ? siteTarget.query : originalQuery;
 
-    // Check cache
-    const cacheKey = makeCacheKey(query, routing.engines, limit);
+    const routing = explicitEngines
+      ? routeExplicit(explicitEngines, query, DISABLED_ENGINES)
+      : route(query, DISABLED_ENGINES);
+
+    // Check cache (key includes both originalQuery and site target so that
+    // `site:gh.com foo` and `foo` don't collide).
+    const cacheKey = makeCacheKey(originalQuery, routing.engines, limit);
     const cached = cache.get(cacheKey);
     if (cached) {
       return formatSearchResponse(cached, routing);
     }
 
-    // Execute engines
+    // Execute engines (skipping any that are circuit-broken)
     const allResults: SearchResult[] = [];
     const attempted: string[] = [];
+    const skipped: string[] = [];
 
     for (const engineName of routing.engines) {
+      if (isEngineFrozen(engineName)) {
+        skipped.push(engineName);
+        continue;
+      }
       try {
         const results = await executeEngine(engineName, query, limit, args, env);
         attempted.push(engineName);
-        allResults.push(...results);
 
-        // Quick mode: stop after first successful engine
-        if (autoMode === 'quick' && results.length > 0) break;
+        // If site: was set, drop results that aren't on the target host.
+        const filtered = siteTarget
+          ? filterBySiteTarget(results, siteTarget.host)
+          : results;
+
+        allResults.push(...filtered);
+
+        // Quick mode: stop after first engine that produced usable results
+        if (autoMode === 'quick' && filtered.length > 0) break;
       } catch {
         attempted.push(engineName);
         continue;
@@ -167,7 +197,7 @@ const toolHandlers: Record<string, ToolHandler> = {
     const processed = processResults(allResults, query, limit);
     const response: SearchResponse = {
       results: processed,
-      query,
+      query: originalQuery,
       engines: attempted,
       cached: false,
     };
@@ -240,6 +270,22 @@ const toolHandlers: Record<string, ToolHandler> = {
 // Engine Execution
 // ============================================================
 
+/** Engines that should be skipped without even being called.
+ *
+ * Use this as a kill-switch when an upstream is down or its API key is
+ * exhausted, so we don't waste a request's timeout budget on a known-bad
+ * engine. Unlike the circuit breaker (which is per-isolate and not
+ * reliable across requests on Cloudflare Workers), this is a hard
+ * static switch — it always wins.
+ *
+ * Current state:
+ *   - `bocha` — disabled. Bocha API key has been returning 403 consistently
+ *     (see SKILL.md §252-253 for original report — quota exhausted).
+ *     Re-enable by removing the entry from this set once the key is
+ *     rotated and quota restored.
+ */
+const DISABLED_ENGINES: ReadonlySet<string> = new Set(['bocha']);
+
 async function executeEngine(
   engineName: string,
   query: string,
@@ -247,27 +293,52 @@ async function executeEngine(
   args: Record<string, unknown>,
   env: Env,
 ): Promise<SearchResult[]> {
-  switch (engineName) {
-    case 'bocha': return searchBocha(query, limit, env);
-    case 'duckduckgo': return searchDuckDuckGo(query, limit, String(args.region || 'us-en'));
-    case 'bing': return searchBing(query, limit);
-    case 'bing_cn': return searchBingCN(query, limit);
-    case 'google': return searchGoogle(query, limit);
-    case 'baidu': return searchBaidu(query, limit);
-    case 'sogou': return searchSogou(query, limit);
-    case 'arxiv': return searchArxiv(query, limit);
-    case 'pubmed': return searchPubMed(query, limit);
-    case 'crossref': return searchCrossRef(query, limit);
-    case 'github': return searchGitHub(query, limit);
-    case 'stackexchange': return searchStackExchange(query, limit, String(args.site || 'stackoverflow'));
-    case 'npm': return searchNpm(query, limit);
-    case 'pypi': return searchPyPI(query, limit);
-    case 'crates': return searchCrates(query, limit);
-    case 'hackernews': return searchHackerNews(query, limit);
-    case 'wikipedia': return searchWikipedia(query, limit, String(args.language || 'en'));
-    case 'wikidata': return searchWikidata(query, limit);
-    case 'ddg_instant': return searchDDGInstantAnswer(query);
-    default: return [];
+  // Hard kill-switch: an engine listed in DISABLED_ENGINES is never called,
+  // even by `search_bocha` / `search_bocha_ai` direct tool calls.
+  if (DISABLED_ENGINES.has(engineName)) {
+    recordEngineHealthEvent(engineName, 'error');
+    throw new Error(`engine '${engineName}' is disabled (see DISABLED_ENGINES in index.ts)`);
+  }
+  // Circuit breaker: skip engines that are currently frozen so a single
+  // tool call doesn't waste its whole timeout budget on a known-bad engine.
+  if (isEngineFrozen(engineName)) {
+    recordEngineHealthEvent(engineName, 'error');
+    throw new Error(`engine '${engineName}' is circuit-broken; try again later`);
+  }
+  try {
+    let results: SearchResult[] = [];
+    switch (engineName) {
+      case 'bocha':         results = await searchBocha(query, limit, env); break;
+      case 'duckduckgo':    results = await searchDuckDuckGo(query, limit, String(args.region || 'us-en')); break;
+      case 'bing':          results = await searchBing(query, limit); break;
+      case 'bing_cn':       results = await searchBingCN(query, limit); break;
+      case 'google':        results = await searchGoogle(query, limit); break;
+      case 'baidu':         results = await searchBaidu(query, limit); break;
+      case 'sogou':         results = await searchSogou(query, limit); break;
+      case 'arxiv':         results = await searchArxiv(query, limit); break;
+      case 'pubmed':        results = await searchPubMed(query, limit); break;
+      case 'crossref':      results = await searchCrossRef(query, limit); break;
+      case 'github':        results = await searchGitHub(query, limit); break;
+      case 'stackexchange': results = await searchStackExchange(query, limit, String(args.site || 'stackoverflow')); break;
+      case 'npm':           results = await searchNpm(query, limit); break;
+      case 'pypi':          results = await searchPyPI(query, limit); break;
+      case 'crates':        results = await searchCrates(query, limit); break;
+      case 'hackernews':    results = await searchHackerNews(query, limit); break;
+      case 'wikipedia':     results = await searchWikipedia(query, limit, String(args.language || 'en')); break;
+      case 'wikidata':      results = await searchWikidata(query, limit); break;
+      case 'ddg_instant':   results = await searchDDGInstantAnswer(query); break;
+      default:              results = [];
+    }
+    if (results.length > 0) recordEngineSuccess(engineName);
+    recordEngineHealthEvent(engineName, results.length > 0 ? 'success' : 'empty');
+    return results;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : 'failed';
+    recordEngineHealthEvent(engineName, 'error');
+    if (isBlockedReason(reason)) {
+      recordEngineBlocked(engineName, reason);
+    }
+    throw err;
   }
 }
 
@@ -319,6 +390,29 @@ function clampLimit(value: unknown): number {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 1) return DEFAULT_RESULT_LIMIT;
   return Math.min(n, MAX_RESULT_LIMIT);
+}
+
+/**
+ * Decide whether an engine error message looks like an anti-bot / quota
+ * blocked signal (4xx, 5xx, CAPTCHA, 403/202 with challenge markers).
+ * If true, the circuit breaker should count it as a failure that
+ * contributes toward freezing the engine.
+ *
+ * Conservative on purpose: we only match clear signals so that transient
+ * network blips (TypeError, fetch failed, etc.) do NOT trip the breaker.
+ */
+function isBlockedReason(reason: string): boolean {
+  const r = reason.toLowerCase();
+  if (r.includes('captcha') || r.includes('challenge')) return true;
+  // HTTP status codes that indicate blocking / anti-bot
+  if (/\b(403|429|503)\b/.test(r)) return true;
+  // Bocha's quota-exhausted 401 / generic 401
+  if (/\b401\b/.test(r) && (r.includes('quota') || r.includes('exhaust') || r.includes('limit'))) {
+    return true;
+  }
+  // 202 with empty body is a CF challenge signal in fetchUrl
+  if (r.includes('202') && (r.includes('empty') || r.includes('challenge'))) return true;
+  return false;
 }
 
 function corsHeaders(): Record<string, string> {

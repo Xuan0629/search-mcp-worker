@@ -142,11 +142,11 @@ const ROUTING_TABLE: Record<Intent, Record<Language, string[]>> = {
   },
 };
 
-export function selectEngines(intent: Intent, language: Language): RouterResult {
+export function selectEngines(intent: Intent, language: Language, disabledEngines?: ReadonlySet<string>): RouterResult {
   const engines = ROUTING_TABLE[intent]?.[language] ?? ROUTING_TABLE.general[language] ?? ROUTING_TABLE.general.any;
 
-  // Filter to engines that exist in registry
-  const available = engines.filter(e => e in ENGINE_REGISTRY);
+  // Filter to engines that exist in registry AND aren't in the disabled set
+  const available = engines.filter(e => e in ENGINE_REGISTRY && !(disabledEngines?.has(e)));
 
   // Check if primary engine needs API key
   const primaryConfig = ENGINE_REGISTRY[available[0]];
@@ -162,18 +162,18 @@ export function selectEngines(intent: Intent, language: Language): RouterResult 
 
 // ---- Main Router Entry ----
 
-export function route(query: string): RouterResult {
+export function route(query: string, disabledEngines?: ReadonlySet<string>): RouterResult {
   const language = detectLanguage(query);
   const intent = classifyIntent(query, language);
-  return selectEngines(intent, language);
+  return selectEngines(intent, language, disabledEngines);
 }
 
 // ---- Batch: route for explicit engine list ----
 
-export function routeExplicit(engines: string[], query: string): RouterResult {
+export function routeExplicit(engines: string[], query: string, disabledEngines?: ReadonlySet<string>): RouterResult {
   const language = detectLanguage(query);
   const intent = classifyIntent(query, language);
-  const available = engines.filter(e => e in ENGINE_REGISTRY);
+  const available = engines.filter(e => e in ENGINE_REGISTRY && !(disabledEngines?.has(e)));
   return {
     engines: available.length > 0 ? available : ['duckduckgo'],
     intent,
