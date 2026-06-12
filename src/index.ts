@@ -5,7 +5,7 @@ import { handleInitialize, handleToolsList, handlePing, makeError, makeToolResul
 import type { ToolHandler } from './mcp/protocol';
 import { route, routeExplicit } from './router';
 import { SearchCache, makeCacheKey } from './cache';
-import { processResults } from './scorer';
+import { processResults, processResultsWithStats } from './scorer';
 import {
   isEngineFrozen,
   recordEngineSuccess,
@@ -228,7 +228,7 @@ const toolHandlers: Record<string, ToolHandler> = {
     const cacheKey = makeCacheKey(originalQuery, routing.engines, limit);
     const cached = cache.get(cacheKey);
     if (cached) {
-      return formatSearchResponse(cached, routing);
+      return formatSearchResponse(cached, routing, { cache_hit: true });
     }
 
     // Execute engines (skipping any that are circuit-broken)
@@ -260,7 +260,7 @@ const toolHandlers: Record<string, ToolHandler> = {
       }
     }
 
-    const processed = processResults(allResults, query, limit);
+    const { results: processed, stats } = processResultsWithStats(allResults, query, limit);
     const response: SearchResponse = {
       results: processed,
       query: originalQuery,
@@ -269,7 +269,12 @@ const toolHandlers: Record<string, ToolHandler> = {
     };
 
     cache.set(cacheKey, response);
-    return formatSearchResponse(response, routing);
+    return formatSearchResponse(response, routing, {
+      cache_hit: false,
+      filtered_count: stats.filtered_count,
+      filter_reason: stats.filter_reason ?? undefined,
+      skipped_engines: skipped,
+    });
   },
 
   // ---- Individual Engine Tools ----
@@ -434,10 +439,31 @@ async function singleEngine(
 function formatSearchResponse(
   response: SearchResponse,
   routing: { engines: string[]; intent: string; language: string },
+  meta?: { filtered_count?: number; filter_reason?: string; skipped_engines?: string[]; cache_hit?: boolean },
 ): McpToolResult {
   const header = `## Search Results\n\nQuery: "${response.query}" | Intent: ${routing.intent} | Lang: ${routing.language} | Engines: ${response.engines.join(', ')}${response.cached ? ' (cached)' : ''}`;
   const text = `${header}\n\n${formatResults(response.results)}`;
-  return makeToolResult(text, response);
+  // structuredContent now carries both the full SearchResponse (for
+  // backwards-compatibility with callers that read it directly) and a
+  // `_meta` block with per-request health/pipeline observability. The
+  // OpenClaw observer pipeline reads `_meta` to decide whether to
+  // cross-reference with another search tool (e.g. when filter_reason
+  // is 'intent_mismatch' suggesting the engine did parse but the
+  // results were off-topic).
+  const structured = {
+    ...response,
+    _meta: {
+      intent: routing.intent,
+      language: routing.language,
+      engines_attempted: response.engines,
+      engines_skipped: meta?.skipped_engines ?? [],
+      cache_hit: meta?.cache_hit ?? response.cached,
+      filtered_count: meta?.filtered_count ?? 0,
+      filter_reason: meta?.filter_reason ?? null,
+      timestamp: new Date().toISOString(),
+    },
+  };
+  return makeToolResult(text, structured);
 }
 
 function formatResults(results: SearchResult[]): string {

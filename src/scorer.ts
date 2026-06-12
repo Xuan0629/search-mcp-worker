@@ -300,11 +300,29 @@ export function rankResults(results: SearchResult[], maxResults: number): Search
 
 // ---- Full Pipeline ----
 
+export interface ProcessStats {
+  filtered_count: number;
+  filter_reason: 'intent_mismatch' | 'low_quality' | null;
+}
+
 export function processResults(
   rawResults: SearchResult[],
   query: string,
   maxResults: number,
 ): SearchResult[] {
+  return processResultsWithStats(rawResults, query, maxResults).results;
+}
+
+/** Like processResults but also returns how many results were dropped
+ * by the hard intent-mismatch filter and the reason. Used by the search
+ * tool to populate _meta.filtered_count / _meta.filter_reason in the
+ * structuredContent response.
+ */
+export function processResultsWithStats(
+  rawResults: SearchResult[],
+  query: string,
+  maxResults: number,
+): { results: SearchResult[]; stats: ProcessStats } {
   const deduped = deduplicateResults(rawResults);
   // Evaluate quality for results that don't have it yet
   const evaluated = deduped.map(r => ({
@@ -314,7 +332,22 @@ export function processResults(
   // Hard intent-mismatch filter: drop CJK SEO spam that shares zero
   // vocabulary with the query, and English results that miss 100% of
   // tokens on long queries.
-  const filtered = evaluated.filter((r) => !isHardIntentMismatch(r, query));
-  const scored = scoreResults(filtered, query);
-  return rankResults(scored, maxResults);
+  const hardFiltered = evaluated.filter((r) => !isHardIntentMismatch(r, query));
+  const filtered_count = evaluated.length - hardFiltered.length;
+
+  // Determine the dominant filter reason (intent_mismatch wins over
+  // generic quality issues because the OpenClaw observer treats it as
+  // "the engine worked but the results were off-topic" — useful signal
+  // for cross-referencing with a different engine).
+  const intentMismatchCount = evaluated.filter((r) => isHardIntentMismatch(r, query)).length;
+  const filter_reason: ProcessStats['filter_reason'] =
+    intentMismatchCount > 0 ? 'intent_mismatch' :
+    filtered_count > 0 ? 'low_quality' :
+    null;
+
+  const scored = scoreResults(hardFiltered, query);
+  return {
+    results: rankResults(scored, maxResults),
+    stats: { filtered_count, filter_reason },
+  };
 }
