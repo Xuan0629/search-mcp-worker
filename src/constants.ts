@@ -25,6 +25,16 @@ export const MAX_GITHUB_FILE_CHARS = 50_000;
 export const CACHE_TTL_MS = 5 * 60 * 1000;         // 5 minutes
 export const CACHE_MAX_ENTRIES = 200;
 
+// Circuit Breaker
+// After CIRCUIT_BREAKER_THRESHOLD blocked responses, the engine is skipped
+// for CIRCUIT_BREAKER_FREEZE_MS to avoid hammering it during transient
+// anti-bot / quota-exhausted windows.
+export const CIRCUIT_BREAKER_THRESHOLD = 3;
+export const CIRCUIT_BREAKER_FREEZE_MS = 5 * 60 * 1000;  // 5 minutes
+
+// Engine health event window (for /health stats)
+export const ENGINE_HEALTH_WINDOW_MS = 60 * 60 * 1000;   // 1 hour
+
 // Results
 export const DEFAULT_RESULT_LIMIT = 5;
 export const MAX_RESULT_LIMIT = 10;
