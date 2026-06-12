@@ -14,17 +14,83 @@ import {
 } from './circuit-breaker';
 import { recordEngineHealthEvent, getEngineHealthStats } from './engine-health';
 import { parseSiteTargetQuery, filterBySiteTarget } from './site-target';
-// Engines
-import { searchBocha, searchBochaAI } from './engines/bocha';
-import { searchDuckDuckGo } from './engines/duckduckgo';
-import { searchBing, searchBingCN } from './engines/bing';
-import { searchBaidu } from './engines/baidu';
-import { searchSogou } from './engines/sogou';
-import { searchArxiv, searchPubMed, searchCrossRef } from './engines/academic';
-import { searchGitHub, searchStackExchange, searchNpm, searchPyPI, searchCrates, searchHackerNews } from './engines/developer';
-import { searchWikipedia, searchWikidata, searchDDGInstantAnswer } from './engines/reference';
-import { searchGoogle } from './engines/google';
-import { fetchUrl, fetchGitHubFile, findRss } from './engines/fetch';
+// Engine modules are loaded lazily via dynamic import() in executeEngine,
+// so each engine's HTML parser, regex, and helper code only lands in the
+// workerd bundle when at least one request actually needs that engine.
+//
+// Type-only imports are fine at the top because TypeScript erases them:
+// they have no runtime cost.
+import type * as BochaEngine from './engines/bocha';
+import type * as DuckDuckGoEngine from './engines/duckduckgo';
+import type * as BingEngine from './engines/bing';
+import type * as BaiduEngine from './engines/baidu';
+import type * as SogouEngine from './engines/sogou';
+import type * as AcademicEngine from './engines/academic';
+import type * as DeveloperEngine from './engines/developer';
+import type * as ReferenceEngine from './engines/reference';
+import type * as GoogleEngine from './engines/google';
+import type * as FetchEngine from './engines/fetch';
+
+// ============================================================
+// Lazy Engine Loader
+// ============================================================
+//
+// Per-engine dynamic import() with a per-isolate cache. We hoist this
+// onto globalThis for the same reason the circuit-breaker and engine-health
+// modules do: dynamic import() is not free, so we don't want every request
+// to re-run the module fetch. Subsequent requests in the same isolate hit
+// the cache and skip the import.
+//
+// The cache is module-name keyed (not request-keyed): we only ever import
+// an engine module the first time a request actually needs it. After that,
+// every subsequent request hits the cache.
+//
+// Caveat for Cloudflare Workers: wrangler's default esbuild config inlines
+// all `import()` targets into a single bundle, so the *shipping* bundle
+// size is unchanged by this refactor. The win is real for any non-bundled
+// runtime (Node ESM, vitest), and the dynamic-import shape leaves the door
+// open for future per-worker split with `[build.bundle = "esbuild" --splitting]`
+// or service-bindings.
+const ENGINE_CACHE_KEY = '__search_mcp_engine_cache__';
+type EngineCache = {
+  bocha?: typeof BochaEngine;
+  duckduckgo?: typeof DuckDuckGoEngine;
+  bing?: typeof BingEngine;
+  baidu?: typeof BaiduEngine;
+  sogou?: typeof SogouEngine;
+  academic?: typeof AcademicEngine;
+  developer?: typeof DeveloperEngine;
+  reference?: typeof ReferenceEngine;
+  google?: typeof GoogleEngine;
+  fetch?: typeof FetchEngine;
+};
+const g = globalThis as typeof globalThis & { [ENGINE_CACHE_KEY]?: EngineCache };
+const engineCache: EngineCache = g[ENGINE_CACHE_KEY] ?? (g[ENGINE_CACHE_KEY] = {});
+
+/** Resolve a single engine module, importing it on first use and caching
+ * the result for subsequent requests in the same isolate. */
+async function loadEngine<K extends keyof EngineCache>(name: K): Promise<NonNullable<EngineCache[K]>> {
+  if (!engineCache[name]) {
+    engineCache[name] = (await import(
+      name === 'bocha'      ? './engines/bocha' :
+      name === 'duckduckgo' ? './engines/duckduckgo' :
+      name === 'bing'       ? './engines/bing' :
+      name === 'baidu'      ? './engines/baidu' :
+      name === 'sogou'      ? './engines/sogou' :
+      name === 'academic'   ? './engines/academic' :
+      name === 'developer'  ? './engines/developer' :
+      name === 'reference'  ? './engines/reference' :
+      name === 'google'     ? './engines/google' :
+                              './engines/fetch'
+    )) as EngineCache[K];
+  }
+  return engineCache[name]!;
+}
+
+/** Test-only: clear the engine cache. */
+export function _resetEngineCache(): void {
+  for (const k of Object.keys(engineCache)) delete (engineCache as Record<string, unknown>)[k];
+}
 
 // ============================================================
 // App
@@ -209,6 +275,7 @@ const toolHandlers: Record<string, ToolHandler> = {
   // ---- Individual Engine Tools ----
   'search_bocha': async (args, env) => singleEngine('bocha', args, env),
   'search_bocha_ai': async (args, env) => {
+    const { searchBochaAI } = await loadEngine('bocha');
     const query = String(args.query);
     const limit = clampLimit(args.limit);
     const { results, answer } = await searchBochaAI(query, limit, env);
@@ -236,6 +303,7 @@ const toolHandlers: Record<string, ToolHandler> = {
   'search_wikipedia': async (args, _env) => singleEngine('wikipedia', args, _env),
   'search_wikidata': async (args, _env) => singleEngine('wikidata', args, _env),
   'instant_answer': async (args, _env) => {
+    const { searchDDGInstantAnswer } = await loadEngine('reference');
     const results = await searchDDGInstantAnswer(String(args.query));
     if (results.length === 0) return makeToolResult('No instant answer found.');
     return makeToolResult(formatResults(results), results);
@@ -243,12 +311,14 @@ const toolHandlers: Record<string, ToolHandler> = {
 
   // ---- Fetch Tools ----
   'fetch_url': async (args, _env) => {
+    const { fetchUrl } = await loadEngine('fetch');
     const url = String(args.url);
     const maxChars = Number(args.maxChars) || 12000;
     const result = await fetchUrl(url, maxChars);
     return makeToolResult(`# ${result.title}\n\nURL: ${result.url}\n\n${result.content}`, result);
   },
   'fetch_github_file': async (args, _env) => {
+    const { fetchGitHubFile } = await loadEngine('fetch');
     const owner = String(args.owner);
     const repo = String(args.repo);
     const path = String(args.path);
@@ -259,9 +329,10 @@ const toolHandlers: Record<string, ToolHandler> = {
     return makeToolResult(`# ${result.path}\n\nURL: ${result.url}${truncated}\n\n${result.content}`, result);
   },
   'find_rss': async (args, _env) => {
-    const feeds = await findRss(String(args.url));
+    const { findRss } = await loadEngine('fetch');
+    const feeds: Array<{ title: string; url: string; type: string }> = await findRss(String(args.url));
     if (feeds.length === 0) return makeToolResult('No RSS/Atom feeds found.');
-    const text = feeds.map(f => `- [${f.title}](${f.url}) (${f.type})`).join('\n');
+    const text = feeds.map((f: { title: string; url: string; type: string }) => `- [${f.title}](${f.url}) (${f.type})`).join('\n');
     return makeToolResult(text, feeds);
   },
 };
@@ -306,27 +377,29 @@ async function executeEngine(
     throw new Error(`engine '${engineName}' is circuit-broken; try again later`);
   }
   try {
+    // Resolve the engine module on first use; subsequent requests in
+    // the same isolate hit the cache and skip the import.
     let results: SearchResult[] = [];
     switch (engineName) {
-      case 'bocha':         results = await searchBocha(query, limit, env); break;
-      case 'duckduckgo':    results = await searchDuckDuckGo(query, limit, String(args.region || 'us-en')); break;
-      case 'bing':          results = await searchBing(query, limit); break;
-      case 'bing_cn':       results = await searchBingCN(query, limit); break;
-      case 'google':        results = await searchGoogle(query, limit); break;
-      case 'baidu':         results = await searchBaidu(query, limit); break;
-      case 'sogou':         results = await searchSogou(query, limit); break;
-      case 'arxiv':         results = await searchArxiv(query, limit); break;
-      case 'pubmed':        results = await searchPubMed(query, limit); break;
-      case 'crossref':      results = await searchCrossRef(query, limit); break;
-      case 'github':        results = await searchGitHub(query, limit); break;
-      case 'stackexchange': results = await searchStackExchange(query, limit, String(args.site || 'stackoverflow')); break;
-      case 'npm':           results = await searchNpm(query, limit); break;
-      case 'pypi':          results = await searchPyPI(query, limit); break;
-      case 'crates':        results = await searchCrates(query, limit); break;
-      case 'hackernews':    results = await searchHackerNews(query, limit); break;
-      case 'wikipedia':     results = await searchWikipedia(query, limit, String(args.language || 'en')); break;
-      case 'wikidata':      results = await searchWikidata(query, limit); break;
-      case 'ddg_instant':   results = await searchDDGInstantAnswer(query); break;
+      case 'bocha':         { const m = await loadEngine('bocha');      results = await m.searchBocha(query, limit, env); break; }
+      case 'duckduckgo':    { const m = await loadEngine('duckduckgo'); results = await m.searchDuckDuckGo(query, limit, String(args.region || 'us-en')); break; }
+      case 'bing':          { const m = await loadEngine('bing');       results = await m.searchBing(query, limit); break; }
+      case 'bing_cn':       { const m = await loadEngine('bing');       results = await m.searchBingCN(query, limit); break; }
+      case 'google':        { const m = await loadEngine('google');     results = await m.searchGoogle(query, limit); break; }
+      case 'baidu':         { const m = await loadEngine('baidu');      results = await m.searchBaidu(query, limit); break; }
+      case 'sogou':         { const m = await loadEngine('sogou');      results = await m.searchSogou(query, limit); break; }
+      case 'arxiv':         { const m = await loadEngine('academic');   results = await m.searchArxiv(query, limit); break; }
+      case 'pubmed':        { const m = await loadEngine('academic');   results = await m.searchPubMed(query, limit); break; }
+      case 'crossref':      { const m = await loadEngine('academic');   results = await m.searchCrossRef(query, limit); break; }
+      case 'github':        { const m = await loadEngine('developer');  results = await m.searchGitHub(query, limit); break; }
+      case 'stackexchange': { const m = await loadEngine('developer');  results = await m.searchStackExchange(query, limit, String(args.site || 'stackoverflow')); break; }
+      case 'npm':           { const m = await loadEngine('developer');  results = await m.searchNpm(query, limit); break; }
+      case 'pypi':          { const m = await loadEngine('developer');  results = await m.searchPyPI(query, limit); break; }
+      case 'crates':        { const m = await loadEngine('developer');  results = await m.searchCrates(query, limit); break; }
+      case 'hackernews':    { const m = await loadEngine('developer');  results = await m.searchHackerNews(query, limit); break; }
+      case 'wikipedia':     { const m = await loadEngine('reference');  results = await m.searchWikipedia(query, limit, String(args.language || 'en')); break; }
+      case 'wikidata':      { const m = await loadEngine('reference');  results = await m.searchWikidata(query, limit); break; }
+      case 'ddg_instant':   { const m = await loadEngine('reference');  results = await m.searchDDGInstantAnswer(query); break; }
       default:              results = [];
     }
     if (results.length > 0) recordEngineSuccess(engineName);
