@@ -1,10 +1,7 @@
 import type { SearchResult } from '../types';
-import { USER_AGENTS, DEFAULT_TIMEOUT_MS } from '../constants';
+import { DEFAULT_TIMEOUT_MS } from '../constants';
 import { decodeHtmlEntities, stripHtmlTags } from '../utils/html';
-
-function randomUA(): string {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
+import { randomUserAgent } from '../utils/http';
 
 function stripHtml(html: string): string {
   return stripHtmlTags(decodeHtmlEntities(html)).trim();
@@ -37,7 +34,7 @@ export async function searchSogou(
 
     const response = await fetch(url, {
       headers: {
-        'User-Agent': randomUA(),
+        'User-Agent': randomUserAgent(),
         'Accept': 'text/html',
         'Accept-Language': 'zh-CN,zh;q=0.9',
       },

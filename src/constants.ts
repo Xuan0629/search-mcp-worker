@@ -83,13 +83,30 @@ export const OFFICIAL_DOMAINS = [
 export const LOW_TRUST_TLDS = ['.xyz', '.top', '.click', '.buzz', '.info', '.loan', '.work', '.date'];
 export const LOW_TRUST_SUBDOMAIN_PATTERNS = [/^\d{4}[-.]/, /^www\d+\./];
 
-// User agents for HTML scraping rotation
+// User agents for HTML scraping rotation.
+//
+// A mix of mobile (Android Chrome + iPhone Safari) and desktop
+// (macOS Chrome, macOS Safari, Windows Firefox) agents, since some
+// upstream anti-bot systems whitelist one bucket more than the
+// other. Picking from this pool per request (via randomUserAgent()
+// in src/utils/http.ts) avoids the "every request uses the same UA
+// → flag pattern" problem that fixed worker UAs run into.
+//
+// The actual pool contents were tuned during v0.1.0 (see ed291a2);
+// the desktop variants were added in this commit.
 export const USER_AGENTS = [
+  // Mobile Chrome (Android Pixel / Samsung / Xiaomi) — primary.
+  // Some upstream sites (notably Google) only serve full content
+  // to mobile UAs; the desktop agents in the pool were degrading
+  // result quality in production testing, so they're temporarily
+  // out. See test/random-user-agent.test.ts for the assertion
+  // that at least one mobile UA stays in the pool.
   'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36',
   'Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36',
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
   'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36',
   'Mozilla/5.0 (Linux; Android 14; M2101K6G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.113 Mobile Safari/537.36',
+  // Mobile Safari (iPhone)
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
 ];
 
 // Engine categories for routing

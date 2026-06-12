@@ -1,9 +1,10 @@
 import type { SearchResult } from '../types';
-import { USER_AGENTS, DEFAULT_TIMEOUT_MS } from '../constants';
+import { DEFAULT_TIMEOUT_MS } from '../constants';
 import { decodeHtmlEntities, stripHtmlTags } from '../utils/html';
+import { randomUserAgent } from '../utils/http';
 
-function randomUA(): string {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+function stripHtml(html: string): string {
+  return stripHtmlTags(decodeHtmlEntities(html)).trim();
 }
 
 /**
@@ -101,10 +102,6 @@ function extractResults(html: string, engine: string): SearchResult[] {
   return results;
 }
 
-function stripHtml(html: string): string {
-  return stripHtmlTags(decodeHtmlEntities(html)).trim();
-}
-
 // DDG has 3 paths: noai, lite, html
 const DDG_PATHS = [
   'https://html.duckduckgo.com/html/?q=',
@@ -128,7 +125,7 @@ export async function searchDuckDuckGo(
 
       const response = await fetch(url, {
         headers: {
-          'User-Agent': randomUA(),
+          'User-Agent': randomUserAgent(),
           'Accept': 'text/html,application/xhtml+xml',
           'Accept-Language': 'en-US,en;q=0.9',
         },
