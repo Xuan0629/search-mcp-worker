@@ -418,7 +418,14 @@ const toolHandlers: Record<string, ToolHandler> = {
     const url = String(args.url);
     const maxChars = Number(args.maxChars) || 12000;
     const result = await fetchUrl(url, maxChars);
-    return makeToolResult(`# ${result.title}\n\nURL: ${result.url}\n\n${result.content}`, result);
+    // For challenge pages, prepend a banner so the user knows the
+    // fetch didn't return real content. The structuredContent
+    // already carries contentType + reason; this is the human-
+    // readable version of the same signal.
+    const banner = result.contentType === 'challenge_page'
+      ? `> ⚠️ ${result.reason ?? 'Upstream returned a challenge page'}\n\n`
+      : '';
+    return makeToolResult(`${banner}# ${result.title}\n\nURL: ${result.url}\n\n${result.content}`, result);
   },
   'fetch_github_file': async (args, _env) => {
     const { fetchGitHubFile } = await loadEngine('fetch');
