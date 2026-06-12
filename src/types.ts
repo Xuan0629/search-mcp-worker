@@ -40,17 +40,6 @@ export interface McpToolResult {
     text: string;
   }>;
   structuredContent?: unknown;
-  /**
-   * Per MCP spec, tool errors should set isError: true so that
-   * protocol-level clients (Claude Desktop, Cursor, the Hermes MCP
-   * bridge, etc.) can distinguish "the tool ran and produced a
-   * textual error" from "the tool ran and produced a normal result
-   * that happens to mention 'error'". Without this flag, a
-   * 404 Not Found surfaces as a normal tool result containing
-   * the text 'Error: HTTP 404: NOT FOUND', which LLMs sometimes
-   * mistake for a real answer.
-   */
-  isError?: boolean;
 }
 
 // ---- Search Types ----
