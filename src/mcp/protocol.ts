@@ -246,6 +246,14 @@ export function makeToolResult(text: string, structured?: unknown): McpToolResul
 
 export function makeToolError(message: string): McpToolResult {
   return {
+    // Per MCP spec, tool-level errors should set isError: true so
+    // that protocol clients (and the user) can distinguish "this
+    // tool failed" from "this tool returned a normal result whose
+    // text happens to contain the word 'error'". The text body
+    // is prefixed with 'Error: ' for human readability — the same
+    // convention used by JSON-RPC and LSP — and isError: true is
+    // the programmatic signal that LLMs and IDEs key on.
+    isError: true,
     content: [{ type: 'text' as const, text: `Error: ${message}` }],
   };
 }
