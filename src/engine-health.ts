@@ -69,3 +69,44 @@ export function getEngineHealthStats(): Record<
 export function _resetEngineHealth(): void {
   records.clear();
 }
+
+/**
+ * Compute a "health score" for an engine based on its 1-hour event log.
+ *
+ * The score is used by the router to rank candidate engines so that
+ * currently-healthy ones are queried first, and recently-broken ones
+ * (a flurry of errors in the last hour) sink to the back of the race.
+ *
+ * Formula (see analysis v2 §6.10):
+ *     score = success * 1.0
+ *           - error   * 2.0   // 'error' covers 5xx, CAPTCHA, quota
+ *           - empty   * 0.3
+ *
+ * Rationale:
+ *   - error > success weight: one blocked call hurts more than one
+ *     success helps, because the cost of routing a query to a dead
+ *     engine (timeout) is much larger than the cost of skipping a
+ *     marginally-healthy one.
+ *   - empty weight: empty ≠ broken (it just means the query had no
+ *     good match on that engine), so we penalize it gently.
+ *
+ * Engines with zero recorded events (cold start) get `null` so the
+ * router can keep them in their declared priority slot rather than
+ * sinking them below warm-but-empty engines.
+ */
+export function healthScore(engine: string): number | null {
+  const r = records.get(engine);
+  if (!r || r.events.length === 0) return null;
+  const now = Date.now();
+  const fresh = r.events.filter((e) => now - e.ts < ENGINE_HEALTH_WINDOW_MS);
+  if (fresh.length === 0) return null;
+  let success = 0;
+  let error = 0;
+  let empty = 0;
+  for (const e of fresh) {
+    if (e.event === 'success') success++;
+    else if (e.event === 'error') error++;
+    else if (e.event === 'empty') empty++;
+  }
+  return success * 1.0 - error * 2.0 - empty * 0.3;
+}

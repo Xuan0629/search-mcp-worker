@@ -1,5 +1,6 @@
 import type { Language, Intent, RouterResult } from './types';
 import { ENGINE_REGISTRY } from './constants';
+import { healthScore } from './engine-health';
 
 // ---- Language Detection ----
 
@@ -148,16 +149,37 @@ export function selectEngines(intent: Intent, language: Language, disabledEngine
   // Filter to engines that exist in registry AND aren't in the disabled set
   const available = engines.filter(e => e in ENGINE_REGISTRY && !(disabledEngines?.has(e)));
 
+  // Rank by health score so the race runs healthy engines first. Stable
+  // sort: engines with no recorded events (cold start) keep their
+  // declared priority slot, and ties keep declaration order. See
+  // engine-health.ts healthScore() for the formula and analysis v2
+  // §6.10 for the rationale.
+  const ranked = rankByHealth(available);
+
   // Check if primary engine needs API key
-  const primaryConfig = ENGINE_REGISTRY[available[0]];
+  const primaryConfig = ENGINE_REGISTRY[ranked[0]];
   const confidence = primaryConfig ? (primaryConfig.requiresApiKey ? 0.9 : 0.95) : 0.7;
 
   return {
-    engines: available,
+    engines: ranked,
     intent,
     language,
     confidence,
   };
+}
+
+/**
+ * Stable-sort `engines` by health score (descending). Engines with no
+ * recorded health events are treated as score 0 (neutral) so a fresh
+ * engine doesn't get penalised below a warm-but-failing one.
+ *
+ * Stability is provided by Array.prototype.sort being stable in V8/JS
+ * since ES2019, which is what CF Workers' runtime uses. Ties therefore
+ * preserve the original ROUTING_TABLE declaration order.
+ */
+function rankByHealth(engines: string[]): string[] {
+  const score = (e: string): number => healthScore(e) ?? 0;
+  return [...engines].sort((a, b) => score(b) - score(a));
 }
 
 // ---- Main Router Entry ----
@@ -174,8 +196,9 @@ export function routeExplicit(engines: string[], query: string, disabledEngines?
   const language = detectLanguage(query);
   const intent = classifyIntent(query, language);
   const available = engines.filter(e => e in ENGINE_REGISTRY && !(disabledEngines?.has(e)));
+  const ranked = rankByHealth(available);
   return {
-    engines: available.length > 0 ? available : ['duckduckgo'],
+    engines: ranked.length > 0 ? ranked : ['duckduckgo'],
     intent,
     language,
     confidence: 0.6,
