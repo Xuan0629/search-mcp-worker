@@ -13,6 +13,7 @@ import {
   OFFICIAL_DOMAINS,
   LOW_TRUST_TLDS,
   LOW_TRUST_SUBDOMAIN_PATTERNS,
+  CJK_INTENT_COVERAGE_MIN,
 } from './constants';
 
 // ---- Quality Evaluation ----
@@ -93,6 +94,107 @@ function tokenize(query: string): string[] {
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .split(/\s+/)
     .filter(t => t.length >= 2);
+}
+
+// ---- Hard Intent Mismatch Filter ----
+
+/**
+ * True if `text` contains at least one CJK character.
+ * Used to gate the CJK-specific intent filter.
+ */
+export function hasCJKText(text: string): boolean {
+  for (const ch of text) {
+    const code = ch.charCodeAt(0);
+    if (
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0x3400 && code <= 0x4dbf) ||
+      (code >= 0xf900 && code <= 0xfaff)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * NFKC-normalised compact comparison. Treats fullwidth / halfwidth variants
+ * (e.g. "ＡＢＣ" vs "abc") as identical. Mirrors the trick used in
+ * Kerry1020/search-mcp-worker to reduce false negatives in CJK matching.
+ */
+function normalizeCompact(text: string): string {
+  return text.normalize('NFKC').replace(/\s+/g, '').toLowerCase();
+}
+
+/**
+ * CJK sub-token coverage: fraction of unique 2-character CJK substrings of
+ * the query that appear anywhere in the result text. A result with coverage
+ * below CJK_INTENT_COVERAGE_MIN (when the query contains ≥1 2-char token) is
+ * almost certainly off-topic for a Chinese query.
+ *
+ * Borrowed heuristic from Kerry1020/search-mcp-worker (re-derived; the
+ * original is GPL-3.0 and our project is MIT).
+ */
+export function cjkSubTokenCoverage(text: string, query: string): number {
+  const queryTokens = tokenize(query).filter((t) => /[\u4e00-\u9fff]/.test(t) && t.length >= 2);
+  if (queryTokens.length === 0) return 1; // not a CJK query; vacuously satisfied
+
+  const compactText = normalizeCompact(text);
+  let hit = 0;
+  const seen = new Set<string>();
+  for (const token of queryTokens) {
+    // Deduplicate repeated tokens to avoid weighting "model 模型 模型" 3x.
+    if (seen.has(token)) continue;
+    seen.add(token);
+    if (compactText.includes(normalizeCompact(token))) hit++;
+  }
+  return hit / queryTokens.length;
+}
+
+/**
+ * Hard intent-mismatch decision for a single result.
+ *
+ * - Non-CJK queries: a result is a mismatch only if it scores zero token hits
+ *   with a 3+-token query (matches the existing SCORE_INTENT_MISMATCH_PENALTY
+ *   rule, but applied as a hard filter rather than just a penalty).
+ * - CJK queries: a result is a mismatch if (a) the full query (NFKC-compact)
+ *   doesn't appear in the text AND (b) no 2+-char CJK token from the query
+ *   appears in the text AND (c) sub-token coverage is below the threshold.
+ *
+ * The intent is to drop Chinese SEO spam that shares zero vocabulary with
+ * the query while keeping legitimate results that paraphrase the query.
+ */
+export function isHardIntentMismatch(
+  result: { title: string; snippet: string },
+  query: string,
+): boolean {
+  const queryTokens = tokenize(query);
+  if (queryTokens.length === 0) return false;
+
+  const title = result.title || '';
+  const snippet = result.snippet || '';
+  const combined = `${title} ${snippet}`;
+
+  if (hasCJKText(query)) {
+    // CJK path: NFKC + compact comparison.
+    const compactText = normalizeCompact(combined);
+    const compactQuery = normalizeCompact(query);
+    if (compactQuery && compactText.includes(compactQuery)) return false;
+
+    // Try per-token match for any 2+ char CJK token.
+    const cjkTokens = queryTokens.filter((t) => /[\u4e00-\u9fff]/.test(t) && t.length >= 2);
+    const tokenMatch = cjkTokens.some((t) => compactText.includes(normalizeCompact(t)));
+    if (tokenMatch) return false;
+
+    // Fall back to sub-token coverage.
+    if (cjkSubTokenCoverage(combined, query) >= CJK_INTENT_COVERAGE_MIN) return false;
+
+    return true;
+  }
+
+  // Non-CJK path: only flag if query is long enough that 0 hits is meaningful.
+  if (queryTokens.length < 3) return false;
+  const lower = combined.toLowerCase();
+  return !queryTokens.some((t) => lower.includes(t.toLowerCase()));
 }
 
 // ---- Deduplication ----
@@ -209,6 +311,10 @@ export function processResults(
     ...r,
     quality: r.quality ?? evaluateQuality(r),
   }));
-  const scored = scoreResults(evaluated, query);
+  // Hard intent-mismatch filter: drop CJK SEO spam that shares zero
+  // vocabulary with the query, and English results that miss 100% of
+  // tokens on long queries.
+  const filtered = evaluated.filter((r) => !isHardIntentMismatch(r, query));
+  const scored = scoreResults(filtered, query);
   return rankResults(scored, maxResults);
 }

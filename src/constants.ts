@@ -38,6 +38,12 @@ export const ENGINE_HEALTH_WINDOW_MS = 60 * 60 * 1000;   // 1 hour
 // `site:example.com query` operator
 export const SITE_TARGET_PATTERN = /^\s*site:([^\s/]+)\s+(.+)$/i;
 
+// Intent mismatch hard filter
+// CJK sub-token coverage below this fraction is treated as a hard mismatch
+// and the result is dropped, not just penalised. Borrowed heuristic from
+// Kerry1020/search-mcp-worker (re-derived, not vendored).
+export const CJK_INTENT_COVERAGE_MIN = 0.15;
+
 // Results
 export const DEFAULT_RESULT_LIMIT = 5;
 export const MAX_RESULT_LIMIT = 10;
