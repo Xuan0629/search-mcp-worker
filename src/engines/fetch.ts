@@ -7,6 +7,7 @@ import {
   MAX_GITHUB_FILE_CHARS,
   FETCH_TIMEOUT_MS,
 } from '../constants';
+import { htmlToBodyText } from '../utils/html';
 
 // ---- fetch_url ----
 
@@ -213,7 +214,7 @@ export async function fetchUrl(
   const title = titleMatch ? titleMatch[1].trim() : url;
 
   // Strip HTML tags for text content
-  const content = stripToPlainText(text, Math.min(maxChars, MAX_URL_CHARS));
+  const content = htmlToBodyText(text, Math.min(maxChars, MAX_URL_CHARS));
 
   return {
     title,
@@ -348,27 +349,7 @@ export async function findRss(
 }
 
 // ---- Helpers ----
-
-function stripToPlainText(html: string, maxChars: number): string {
-  // Remove script and style blocks entirely
-  let text = html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<nav[\s\S]*?<\/nav>/gi, '')
-    .replace(/<footer[\s\S]*?<\/footer>/gi, '')
-    .replace(/<header[\s\S]*?<\/header>/gi, '');
-
-  // Strip remaining tags
-  text = text
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  return text.slice(0, maxChars);
-}
+//
+// HTML stripping/tag-decoding helpers live in src/utils/html.ts and
+// are shared across all 6 HTML-scraping engines + the fetchUrl tool
+// (see test/html-utils.test.ts for the per-function contract).

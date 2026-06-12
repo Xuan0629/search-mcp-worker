@@ -1,5 +1,6 @@
 import type { SearchResult } from '../types';
 import { DEFAULT_TIMEOUT_MS } from '../constants';
+import { decodeHtmlEntities, stripHtmlTags } from '../utils/html';
 
 // ---- GitHub Repos ----
 
@@ -276,10 +277,5 @@ export async function searchHackerNews(
 // ---- Helper ----
 
 function stripHtml(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .trim();
+  return stripHtmlTags(decodeHtmlEntities(html)).trim();
 }

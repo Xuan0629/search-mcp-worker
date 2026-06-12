@@ -1,20 +1,13 @@
 import type { SearchResult } from '../types';
 import { USER_AGENTS, DEFAULT_TIMEOUT_MS } from '../constants';
+import { decodeHtmlEntities, stripHtmlTags } from '../utils/html';
 
 function randomUA(): string {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
 function stripHtml(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .trim();
+  return stripHtmlTags(decodeHtmlEntities(html)).trim();
 }
 
 export async function searchBaidu(
