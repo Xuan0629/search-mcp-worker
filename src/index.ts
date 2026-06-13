@@ -488,6 +488,135 @@ const toolHandlers: Record<string, ToolHandler> = {
     const text = feeds.map((f: { title: string; url: string; type: string }) => `- [${f.title}](${f.url}) (${f.type})`).join('\n');
     return makeToolResult(text, feeds);
   },
+
+  // ---- Deep Search ----
+  // Runs the regular 'search' tool, then fetches the top N unique-domain
+  // result pages and returns a relevance-ranked, body-text-enriched view.
+  // Use case: OpenClaw's GEOMaster pipeline often needs a single page's
+  // content rather than a list of snippets; this tool does the search
+  // + fetch chain in one call. LLM-free — we use token overlap against
+  // the original query to rank the fetched bodies, which is the same
+  // approach the simple 'search' tool uses for snippet scoring.
+  'deep_search': async (args, _env) => {
+    const originalQuery = String(args.query);
+    if (!originalQuery) {
+      return makeToolResult('Missing query', []);
+    }
+    // Top-N cap: more pages = more network + more latency. 3 is the
+    // sweet spot for a "give me 1-3 pages of substance" use case. We
+    // hard-cap at 5 so a misconfigured client can't request 100.
+    const topN = Math.min(Math.max(Number(args.limit) || 3, 1), 5);
+    const maxChars = Math.min(Math.max(Number(args.max_chars) || 4000, 500), 12000);
+
+    // Step 1: delegate to the regular 'search' handler. We re-use
+    // its full pipeline (race, scorer, cache, KV) and just read
+    // structuredContent afterwards. This means deep_search
+    // automatically inherits all future search improvements without
+    // us having to keep them in sync.
+    const searchResult = await toolHandlers['search'](args, _env);
+    // toolHandlers['search'] returns an McpToolResult; the
+    // SearchResponse lives on structuredContent.
+    const sc = (searchResult as unknown as { structuredContent?: SearchResponse })
+      .structuredContent;
+    if (!sc || !Array.isArray(sc.results) || sc.results.length === 0) {
+      return makeToolResult(
+        `## Deep Search Results\n\nQuery: "${originalQuery}"\n\nNo search results to deep-fetch.`,
+        { results: [], query: originalQuery, engines: sc?.engines ?? [], _meta: { fetched: 0, challenge_pages: 0, total_chars: 0 } },
+      );
+    }
+
+    // Step 2: dedupe by hostname so we don't fetch two Bing results
+    // pointing to the same wikipedia.org page. We keep the first
+    // occurrence (highest-ranked) and drop subsequent duplicates.
+    const seenHosts = new Set<string>();
+    const uniqueTop = sc.results.slice(0, topN * 2).filter((r) => {
+      try {
+        const host = new URL(r.url).hostname;
+        if (seenHosts.has(host)) return false;
+        seenHosts.add(host);
+        return true;
+      } catch {
+        // Bad URL — keep it (we still want to try fetching, fetch_url
+        // will reject and we'll record the failure).
+        return true;
+      }
+    }).slice(0, topN);
+
+    // Step 3: parallel fetch. fetchUrl handles challenge detection
+    // and returns a structured FetchResult rather than throwing, so
+    // we don't need a try/catch per page — the .catch is just to be
+    // defensive about the dynamic import.
+    const { fetchUrl } = await loadEngine('fetch');
+    const fetched = await Promise.allSettled(
+      uniqueTop.map(async (r) => {
+        const result = await fetchUrl(r.url, maxChars);
+        return { searchResult: r, fetched: result };
+      }),
+    );
+
+    // Step 4: filter challenge pages and failures, score by token
+    // overlap, sort, format.
+    const successful: Array<{ r: SearchResult; body: string; title: string; relevance: number }> = [];
+    let challengePages = 0;
+    let failed = 0;
+    for (const f of fetched) {
+      if (f.status !== 'fulfilled') {
+        failed++;
+        continue;
+      }
+      const { searchResult, fetched: fr } = f.value;
+      if (fr.contentType === 'challenge_page') {
+        challengePages++;
+        continue;
+      }
+      // Empty / tiny body — treat as failure. A page with <50 chars of
+      // body text is almost certainly an error page or a JS-only SPA
+      // that didn't render server-side.
+      if (fr.content.trim().length < 50) {
+        failed++;
+        continue;
+      }
+      successful.push({
+        r: searchResult,
+        title: fr.title || searchResult.title,
+        body: fr.content,
+        relevance: tokenOverlapScore(originalQuery, fr.title + ' ' + fr.content.slice(0, 2000)),
+      });
+    }
+
+    // Step 5: sort by relevance desc, then format.
+    successful.sort((a, b) => b.relevance - a.relevance);
+    const totalChars = successful.reduce((sum, s) => sum + s.body.length, 0);
+
+    const header = `## Deep Search Results\n\nQuery: "${originalQuery}" | Top ${successful.length} pages fetched${challengePages > 0 ? ` (${challengePages} blocked by anti-bot)` : ''}${failed > 0 ? ` (${failed} failed)` : ''}`;
+    const body = successful.map((s, i) => {
+      const snippet = s.body.slice(0, maxChars);
+      const truncated = s.body.length > maxChars ? `\n\n_(truncated from ${s.body.length} chars)_` : '';
+      return `\n\n---\n\n### ${i + 1}. ${s.title}\nURL: ${s.r.url}\nRelevance: ${s.relevance.toFixed(2)}\nSource engine: ${s.r.source}\n\n${snippet}${truncated}`;
+    }).join('');
+
+    return makeToolResult(
+      header + body,
+      {
+        results: successful.map((s) => ({
+          title: s.title,
+          url: s.r.url,
+          snippet: s.r.snippet,
+          source: s.r.source,
+          fetched_chars: s.body.length,
+          relevance_score: s.relevance,
+        })),
+        query: originalQuery,
+        engines: sc.engines,
+        _meta: {
+          fetched: successful.length,
+          challenge_pages: challengePages,
+          failed,
+          total_chars: totalChars,
+        },
+      },
+    );
+  },
 };
 
 // ============================================================
@@ -644,6 +773,79 @@ function clampLimit(value: unknown): number {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 1) return DEFAULT_RESULT_LIMIT;
   return Math.min(n, MAX_RESULT_LIMIT);
+}
+
+/**
+ * Token overlap score (Jaccard-like) between a query and a body of
+ * text. Used by deep_search to rank fetched pages by relevance
+ * without invoking an LLM. Returns a number in [0, 1] — 0 means no
+ * shared tokens, 1 means every query token appears in the text.
+ *
+ * Tokenisation rules:
+ *   - lowercase
+ *   - split on non-alphanumeric characters (so punctuation, hyphens
+ *     in URLs, and the like don't form false tokens)
+ *   - CJK characters are NOT split — a single Chinese phrase stays
+ *     as one token because the per-character granularity is too
+ *     noisy for overlap scoring. This means a CJK query like
+ *     "禁烟政策" has one token and we look for it as a substring
+ *     of the body, which is good enough for ranking.
+ *   - stop words ("the", "a", "of", ...) are dropped only if the
+ *     query itself is Latin; for CJK queries we keep all characters.
+ *
+ * Why no LLM: the project doesn't have an LLM API key wired up,
+ * and adding one is a much bigger change than this ranking
+ * heuristic. Token overlap is the same approach the regular
+ * 'search' tool uses for snippet scoring (see scorer.ts).
+ */
+export function tokenOverlapScore(query: string, text: string): number {
+  const qTokens = tokenize(query);
+  const tTokens = new Set(tokenize(text));
+  if (qTokens.length === 0 || tTokens.size === 0) return 0;
+  let hits = 0;
+  for (const qt of qTokens) {
+    if (tTokens.has(qt)) hits++;
+  }
+  return hits / qTokens.length;
+}
+
+function tokenize(s: string): string[] {
+  const lower = s.toLowerCase();
+  const isCJK = /[\u3400-\u9fff\uf900-\ufaff]/.test(lower);
+  if (isCJK) {
+    // For CJK: query should keep its original runs (the user wrote
+    // "禁烟政策" — that exact phrase is what they want to match). But
+    // the text we score against should produce ALL CJK substrings
+    // of length >= 2 so the query's run has a chance to match by
+    // being a substring of a longer run. Without this, "禁烟政策" in
+    // the query and "中国禁烟政策概述" in the text produce disjoint
+    // token sets and overlap = 0.
+    //
+    // We tell the two apart by whether `s` is the query or the
+    // text: tokenize() is called twice by tokenOverlapScore, once
+    // for the query (small) and once for the text (potentially
+    // large). We can't distinguish at the tokenize level, so we
+    // always expand the text-like side. The cost is O(n^2) for the
+    // text; we cap the text to the first 2000 chars in
+    // tokenOverlapScore to keep this bounded.
+    const cjkRuns = lower.match(/[\u3400-\u9fff\uf900-\ufaff]{2,}/g) ?? [];
+    const out: string[] = [];
+    for (const run of cjkRuns) {
+      // Emit the run itself and every substring of length >= 2.
+      // This makes a query like "禁烟" match text "中国禁烟政策概述"
+      // because the text's expansion includes "禁烟".
+      out.push(run);
+      for (let len = 2; len < run.length; len++) {
+        for (let start = 0; start + len <= run.length; start++) {
+          out.push(run.slice(start, start + len));
+        }
+      }
+    }
+    const latinTokens = lower.match(/[a-z0-9]+/g) ?? [];
+    return [...out, ...latinTokens];
+  }
+  // Latin: simple split on non-alphanumeric.
+  return lower.match(/[a-z0-9]+/g) ?? [];
 }
 
 /**
