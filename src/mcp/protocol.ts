@@ -170,6 +170,20 @@ export function getToolList(): McpTool[] {
         required: ['url'],
       },
     },
+    // === Deep Search ===
+    {
+      name: 'deep_search',
+      description: 'Search then fetch and rank the top N unique-domain results. Returns body text (not just snippets) sorted by token-overlap relevance. LLM-free.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Search query' },
+          limit: { type: 'number', description: 'Top N unique-domain results to fetch (1-5)', default: 3, minimum: 1, maximum: 5 },
+          max_chars: { type: 'number', description: 'Per-page char cap (500-12000)', default: 4000, minimum: 500, maximum: 12000 },
+        },
+        required: ['query'],
+      },
+    },
   ];
 }
 
