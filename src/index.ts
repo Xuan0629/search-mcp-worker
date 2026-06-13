@@ -13,6 +13,8 @@ import {
   getCircuitState,
 } from './circuit-breaker';
 import { recordEngineHealthEvent, getEngineHealthStats } from './engine-health';
+import { kvCacheSet, warmup as warmupKvCache } from './kv-cache';
+import type { CachedResponse } from './types';
 import { parseSiteTargetQuery, filterBySiteTarget } from './site-target';
 // Engine modules are loaded lazily via dynamic import() in executeEngine,
 // so each engine's HTML parser, regex, and helper code only lands in the
@@ -130,6 +132,17 @@ function getSecretStatus(env: Env): Record<string, 'set' | 'missing' | 'disabled
 const app = new Hono<{ Bindings: Env }>();
 const cache = new SearchCache();
 
+// Per-isolate KV warmup guard. The first /mcp request on a fresh
+// isolate pulls up to KV_CACHE_WARMUP_LIMIT recent entries from
+// SEARCH_CACHE and seeds the in-memory L1 cache. After that we set
+// the flag and skip warmup for the lifetime of this isolate. See
+// src/kv-cache.ts::warmup and analysis v2 §6.12 for why we don't
+// hydrate synchronously at module load (no `env` available there)
+// and why we don't warm on every request (KV read cost).
+const KV_WARMUP_KEY = '__search_mcp_kv_warmed__';
+type GlobalWithWarmup = typeof globalThis & { [KV_WARMUP_KEY]?: boolean };
+const warmupGuard = globalThis as GlobalWithWarmup;
+
 // ---- Health Check ----
 
 app.get('/', (c) => c.json({
@@ -221,6 +234,29 @@ async function handleToolCall(request: JsonRpcRequest, env: Env): Promise<JsonRp
 
   if (!toolName) {
     return makeError(request, -32602, 'Missing tool name');
+  }
+
+  // First-call-per-isolate KV warmup. We check the globalThis flag
+  // before the await so the common case (already-warm isolate) is
+  // a single boolean read. The await itself is on a background
+  // path: the response will be served after the engines finish
+  // running (3-8s), so the warmup latency (~500ms) is hidden.
+  if (!warmupGuard[KV_WARMUP_KEY] && env.SEARCH_CACHE) {
+    warmupGuard[KV_WARMUP_KEY] = true;
+    void (async () => {
+      const { hydrated, errors } = await warmupKvCache(env.SEARCH_CACHE);
+      if (errors > 0) {
+        console.warn(`[kv-cache] warmup completed with ${errors} errors, hydrated ${hydrated.size} entries`);
+      }
+      // Seed L1 with whatever we got. cache.set handles the
+      // cached:true flag and the L1 5min TTL itself, so we don't
+      // need to re-wrap. If `data.cached` was false on the wire,
+      // it will be re-marked true by L1 — that's correct, because
+      // once it's in L1 it IS a cache hit by definition.
+      for (const [key, data] of hydrated) {
+        cache.set(key, data);
+      }
+    })();
   }
 
   const handler = toolHandlers[toolName];
@@ -366,12 +402,19 @@ const toolHandlers: Record<string, ToolHandler> = {
     };
 
     cache.set(cacheKey, response);
+    // L2 KV write: awaited (not fire-and-forget) so we can report
+    // the result in _meta.kv_write_ok. The +10ms is acceptable
+    // here because the engines already took 3-8s. If the write
+    // fails (binding absent, KV quota, network), we still return
+    // the search response — L1 hit the user either way.
+    const kvWriteOk = await kvCacheSet(env.SEARCH_CACHE, cacheKey, response);
     return formatSearchResponse(response, routing, {
       cache_hit: false,
       filtered_count: stats.filtered_count,
       filter_reason: stats.filter_reason ?? undefined,
       skipped_engines: [...skipped, ...timedOut],
       timed_out_engines: timedOut,
+      kv_write_ok: kvWriteOk,
     });
   },
 
@@ -544,7 +587,7 @@ async function singleEngine(
 function formatSearchResponse(
   response: SearchResponse,
   routing: { engines: string[]; intent: string; language: string },
-  meta?: { filtered_count?: number; filter_reason?: string; skipped_engines?: string[]; cache_hit?: boolean; timed_out_engines?: string[] },
+  meta?: { filtered_count?: number; filter_reason?: string; skipped_engines?: string[]; cache_hit?: boolean; timed_out_engines?: string[]; kv_write_ok?: boolean },
 ): McpToolResult {
   const header = `## Search Results\n\nQuery: "${response.query}" | Intent: ${routing.intent} | Lang: ${routing.language} | Engines: ${response.engines.join(', ')}${response.cached ? ' (cached)' : ''}`;
   const text = `${header}\n\n${formatResults(response.results)}`;
@@ -555,6 +598,11 @@ function formatSearchResponse(
   // cross-reference with another search tool (e.g. when filter_reason
   // is 'intent_mismatch' suggesting the engine did parse but the
   // results were off-topic).
+  //
+  // kv_write_ok: reports whether the L2 KV write succeeded. null
+  // means the binding was absent (e.g. test env). false means the
+  // write was attempted and failed (KV quota / network). Used to
+  // diagnose why cross-isolate caching isn't working in production.
   const structured = {
     ...response,
     _meta: {
@@ -566,6 +614,7 @@ function formatSearchResponse(
       cache_hit: meta?.cache_hit ?? response.cached,
       filtered_count: meta?.filtered_count ?? 0,
       filter_reason: meta?.filter_reason ?? null,
+      kv_write_ok: meta?.kv_write_ok ?? null,
       timestamp: new Date().toISOString(),
     },
   };

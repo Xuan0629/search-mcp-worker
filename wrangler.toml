@@ -7,3 +7,11 @@ compatibility_flags = ["nodejs_compat"]
 ENVIRONMENT = "production"
 
 # Secret: BOCHA_API_KEY — set via `wrangler secret put BOCHA_API_KEY`
+
+# KV namespace for cross-isolate search-result cache. Created
+# 2026-06-13 with `wrangler kv namespace create SEARCH_CACHE`.
+# See src/kv-cache.ts for the fire-and-forget write pattern and
+# analysis v2 §6.12 for the design rationale.
+[[kv_namespaces]]
+binding = "SEARCH_CACHE"
+id = "d7387627adcc4ba9bc26e392517fb77a"

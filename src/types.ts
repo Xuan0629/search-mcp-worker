@@ -104,6 +104,11 @@ export interface CachedResponse {
 export interface Env {
   BOCHA_API_KEY: string;
   ENVIRONMENT?: string;
+  // KV namespace binding for the cross-isolate search-result cache.
+  // Declared in wrangler.toml as `binding = "SEARCH_CACHE"`. See
+  // src/kv-cache.ts for the read/write pattern and analysis v2
+  // §6.12 for the design rationale.
+  SEARCH_CACHE: KVNamespace;
 }
 
 // ---- Utility ----

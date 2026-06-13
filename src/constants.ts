@@ -25,6 +25,13 @@ export const MAX_GITHUB_FILE_CHARS = 50_000;
 export const CACHE_TTL_MS = 5 * 60 * 1000;         // 5 minutes
 export const CACHE_MAX_ENTRIES = 200;
 
+// KV (L2) cache — longer TTL because writes cost KV free-tier quota.
+// 1 hour matches the engine-health window so a recurring query stays
+// warm across isolates but stale queries still drop out before the
+// day ends.
+export const KV_CACHE_TTL_MS = 60 * 60 * 1000;     // 1 hour
+export const KV_CACHE_WARMUP_LIMIT = 100;          // entries to hydrate on cold start
+
 // Circuit Breaker
 // After CIRCUIT_BREAKER_THRESHOLD blocked responses, the engine is skipped
 // for CIRCUIT_BREAKER_FREEZE_MS to avoid hammering it during transient
